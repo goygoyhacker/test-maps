@@ -9,7 +9,7 @@ from streamlit_folium import st_folium
 from streamlit_js_eval import get_geolocation
 
 DB_FILE = "locations.db"
-ADMIN_PASSWORD = "admin123"
+ADMIN_PASSWORD = "goygoyadmin"
 PH_TIMEZONE = ZoneInfo("Asia/Manila")
 
 st.set_page_config(page_title="Simple Field Location Monitor", layout="wide")
