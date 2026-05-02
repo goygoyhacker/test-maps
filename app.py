@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -5,11 +6,12 @@ from zoneinfo import ZoneInfo
 import folium
 import pandas as pd
 import streamlit as st
+from folium.plugins import Draw
 from streamlit_folium import st_folium
 from streamlit_js_eval import get_geolocation
 
 DB_FILE = "locations.db"
-ADMIN_PASSWORD = "goygoyadmin"
+ADMIN_PASSWORD = "admin123"
 PH_TIMEZONE = ZoneInfo("Asia/Manila")
 
 st.set_page_config(page_title="Simple Field Location Monitor", layout="wide")
@@ -39,6 +41,7 @@ def init_db():
             longitude REAL NOT NULL,
             accuracy REAL,
             event_type TEXT,
+            site_name TEXT,
             created_at TEXT NOT NULL
         )
         """
@@ -51,7 +54,8 @@ def init_db():
             sender TEXT NOT NULL,
             receiver TEXT NOT NULL,
             message TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            is_deleted INTEGER DEFAULT 0
         )
         """
     )
@@ -67,9 +71,38 @@ def init_db():
         """
     )
 
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS geofences (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            site_name TEXT NOT NULL,
+            polygon_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_geofence_states (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            site_id INTEGER NOT NULL,
+            is_inside INTEGER NOT NULL,
+            last_event TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+    # Fix old database if columns do not exist yet
+    c.execute("PRAGMA table_info(locations)")
+    location_columns = [col[1] for col in c.fetchall()]
+    if "site_name" not in location_columns:
+        c.execute("ALTER TABLE locations ADD COLUMN site_name TEXT")
+
     c.execute("PRAGMA table_info(messages)")
     message_columns = [col[1] for col in c.fetchall()]
-
     if "is_deleted" not in message_columns:
         c.execute("ALTER TABLE messages ADD COLUMN is_deleted INTEGER DEFAULT 0")
 
@@ -80,13 +113,14 @@ def init_db():
 # -----------------------------
 # LOCATION FUNCTIONS
 # -----------------------------
-def save_location(name, role, lat, lon, accuracy, event_type):
+def save_location(name, role, lat, lon, accuracy, event_type, site_name=None):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(
         """
-        INSERT INTO locations (name, role, latitude, longitude, accuracy, event_type, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO locations 
+        (name, role, latitude, longitude, accuracy, event_type, site_name, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             name,
@@ -95,6 +129,7 @@ def save_location(name, role, lat, lon, accuracy, event_type):
             lon,
             accuracy,
             event_type,
+            site_name,
             get_ph_time(),
         ),
     )
@@ -121,6 +156,7 @@ def delete_all_location_records():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("DELETE FROM locations")
+    c.execute("DELETE FROM user_geofence_states")
     conn.commit()
     conn.close()
 
@@ -152,6 +188,7 @@ def attendance_summary(df):
         summary_rows.append(
             {
                 "name": user,
+                "site_name": latest_location.get("site_name", ""),
                 "time_in": latest_time_in,
                 "time_out": latest_time_out,
                 "latest_event": latest_location["event_type"],
@@ -272,19 +309,235 @@ def delete_all_messages():
 
 
 # -----------------------------
-# MAP FUNCTION
+# GEOFENCE FUNCTIONS
 # -----------------------------
-def make_map(df):
+def save_geofence(site_name, polygon_coordinates):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO geofences (site_name, polygon_json, created_at)
+        VALUES (?, ?, ?)
+        """,
+        (site_name, json.dumps(polygon_coordinates), get_ph_time()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_geofences():
+    conn = sqlite3.connect(DB_FILE)
+    df = pd.read_sql_query("SELECT * FROM geofences ORDER BY id DESC", conn)
+    conn.close()
+    return df
+
+
+def delete_geofence(site_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM geofences WHERE id = ?", (site_id,))
+    c.execute("DELETE FROM user_geofence_states WHERE site_id = ?", (site_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_geofence_by_id(site_id):
+    conn = sqlite3.connect(DB_FILE)
+    df = pd.read_sql_query(
+        "SELECT * FROM geofences WHERE id = ?",
+        conn,
+        params=(site_id,),
+    )
+    conn.close()
+
     if df.empty:
-        return folium.Map(location=[8.4542, 124.6319], zoom_start=12)
+        return None
+
+    return df.iloc[0]
+
+
+def point_inside_polygon(lat, lon, polygon_coordinates):
+    """
+    polygon_coordinates is GeoJSON format:
+    [
+        [
+            [longitude, latitude],
+            [longitude, latitude],
+            ...
+        ]
+    ]
+    """
+
+    if not polygon_coordinates:
+        return False
+
+    polygon = polygon_coordinates[0]
+
+    x = lon
+    y = lat
+    inside = False
+
+    j = len(polygon) - 1
+
+    for i in range(len(polygon)):
+        xi = polygon[i][0]
+        yi = polygon[i][1]
+        xj = polygon[j][0]
+        yj = polygon[j][1]
+
+        intersect = ((yi > y) != (yj > y)) and (
+            x < (xj - xi) * (y - yi) / ((yj - yi) + 0.0000000001) + xi
+        )
+
+        if intersect:
+            inside = not inside
+
+        j = i
+
+    return inside
+
+
+def get_user_geofence_state(username, site_id):
+    conn = sqlite3.connect(DB_FILE)
+    df = pd.read_sql_query(
+        """
+        SELECT *
+        FROM user_geofence_states
+        WHERE username = ? AND site_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        conn,
+        params=(username, site_id),
+    )
+    conn.close()
+
+    if df.empty:
+        return None
+
+    return df.iloc[0]
+
+
+def save_user_geofence_state(username, site_id, is_inside, last_event):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+
+    c.execute(
+        """
+        DELETE FROM user_geofence_states
+        WHERE username = ? AND site_id = ?
+        """,
+        (username, site_id),
+    )
+
+    c.execute(
+        """
+        INSERT INTO user_geofence_states 
+        (username, site_id, is_inside, last_event, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            username,
+            site_id,
+            1 if is_inside else 0,
+            last_event,
+            get_ph_time(),
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def check_geofence_and_auto_attendance(username, site_id, lat, lon, accuracy):
+    site = get_geofence_by_id(site_id)
+
+    if site is None:
+        return "No geofence site found."
+
+    site_name = site["site_name"]
+    polygon_coordinates = json.loads(site["polygon_json"])
+
+    is_inside_now = point_inside_polygon(lat, lon, polygon_coordinates)
+    previous_state = get_user_geofence_state(username, site_id)
+
+    if previous_state is None:
+        if is_inside_now:
+            save_location(username, "user", lat, lon, accuracy, "Time In", site_name)
+            save_user_geofence_state(username, site_id, True, "Time In")
+            return f"Inside {site_name}. Automatic Time In recorded."
+        else:
+            save_location(username, "user", lat, lon, accuracy, "Location Update", site_name)
+            save_user_geofence_state(username, site_id, False, "Outside")
+            return f"Outside {site_name}. No Time In yet."
+
+    was_inside = bool(previous_state["is_inside"])
+
+    if not was_inside and is_inside_now:
+        save_location(username, "user", lat, lon, accuracy, "Time In", site_name)
+        save_user_geofence_state(username, site_id, True, "Time In")
+        return f"You entered {site_name}. Automatic Time In recorded."
+
+    if was_inside and not is_inside_now:
+        save_location(username, "user", lat, lon, accuracy, "Time Out", site_name)
+        save_user_geofence_state(username, site_id, False, "Time Out")
+        return f"You left {site_name}. Automatic Time Out recorded."
+
+    if is_inside_now:
+        save_location(username, "user", lat, lon, accuracy, "Location Update", site_name)
+        save_user_geofence_state(username, site_id, True, "Inside")
+        return f"Still inside {site_name}. Location updated."
+
+    save_location(username, "user", lat, lon, accuracy, "Location Update", site_name)
+    save_user_geofence_state(username, site_id, False, "Outside")
+    return f"Still outside {site_name}. Location updated."
+
+
+# -----------------------------
+# MAP FUNCTIONS
+# -----------------------------
+def add_geofence_polygons_to_map(m, geofences_df):
+    if geofences_df.empty:
+        return m
+
+    for _, row in geofences_df.iterrows():
+        polygon_coordinates = json.loads(row["polygon_json"])
+
+        # Convert GeoJSON lon,lat to Folium lat,lon
+        folium_polygon = []
+        for point in polygon_coordinates[0]:
+            lon = point[0]
+            lat = point[1]
+            folium_polygon.append([lat, lon])
+
+        folium.Polygon(
+            locations=folium_polygon,
+            popup=f"Geofence: {row['site_name']}",
+            tooltip=row["site_name"],
+            fill=True,
+        ).add_to(m)
+
+    return m
+
+
+def make_map(df, geofences_df=None):
+    if df.empty:
+        m = folium.Map(location=[8.4542, 124.6319], zoom_start=12)
+        if geofences_df is not None:
+            m = add_geofence_polygons_to_map(m, geofences_df)
+        return m
 
     center_lat = df["latitude"].mean()
     center_lon = df["longitude"].mean()
     m = folium.Map(location=[center_lat, center_lon], zoom_start=16)
 
+    if geofences_df is not None:
+        m = add_geofence_polygons_to_map(m, geofences_df)
+
     for _, row in df.iterrows():
         popup = (
             f"<b>{row['name']}</b><br>"
+            f"Site: {row.get('site_name', '')}<br>"
             f"Event: {row.get('event_type', '')}<br>"
             f"Time: {row['created_at']}<br>"
             f"Accuracy: {row.get('accuracy', 'N/A')} meters"
@@ -306,6 +559,29 @@ def make_map(df):
     return m
 
 
+def make_draw_map(existing_geofences_df):
+    m = folium.Map(location=[8.4542, 124.6319], zoom_start=14)
+
+    m = add_geofence_polygons_to_map(m, existing_geofences_df)
+
+    draw = Draw(
+        export=False,
+        draw_options={
+            "polyline": False,
+            "rectangle": False,
+            "circle": False,
+            "circlemarker": False,
+            "marker": False,
+            "polygon": True,
+        },
+        edit_options={"edit": False},
+    )
+
+    draw.add_to(m)
+
+    return m
+
+
 # Start database
 init_db()
 
@@ -313,8 +589,11 @@ init_db()
 # -----------------------------
 # APP UI
 # -----------------------------
-st.title("📍 Simple Field Location Monitor")
-st.caption("Prototype only: user shares location with permission, admin views latest location on a map.")
+st.title("📍 Simple Field Location Monitor with Polygon Geofencing")
+st.caption(
+    "Prototype only: admin draws a polygon geofence, user shares location with permission, "
+    "and the system automatically records Time In or Time Out while the page is open."
+)
 
 mode = st.sidebar.radio("Choose screen", ["User End", "Admin End"])
 
@@ -326,12 +605,24 @@ if mode == "User End":
     st.header("User End / Field Worker")
 
     st.info(
-        "Step 1: Enter your name. Step 2: Choose Time In or Time Out. "
-        "Step 3: Press the big location button below and allow location permission."
+        "Enter your name, choose your assigned geofence site, then press Start Geofence Monitoring."
     )
 
     name = st.text_input("Your name", placeholder="Example: Josh")
-    event_type = st.selectbox("Action", ["Location Update", "Time In", "Time Out"])
+
+    geofences_df = load_geofences()
+
+    if geofences_df.empty:
+        st.error("No geofence site has been created yet. Ask the admin to draw and save a geofence first.")
+        selected_site_id = None
+    else:
+        site_options = {
+            f"{row['site_name']} (ID {row['id']})": int(row["id"])
+            for _, row in geofences_df.iterrows()
+        }
+
+        selected_site_label = st.selectbox("Assigned Geofence Site", list(site_options.keys()))
+        selected_site_id = site_options[selected_site_label]
 
     # -----------------------------
     # USER RECEIVES ADMIN MESSAGES
@@ -380,26 +671,41 @@ if mode == "User End":
     show_admin_messages(name)
 
     # -----------------------------
-    # USER SENDS LOCATION
+    # AUTOMATIC GEOFENCE MONITORING
     # -----------------------------
-    st.subheader("Send My Location")
+    st.subheader("Automatic Geofence Time In / Time Out")
 
-    st.markdown(
-        """
-        ### Press this button first:
-        """
-    )
+    if "monitoring_started" not in st.session_state:
+        st.session_state.monitoring_started = False
 
-    if "request_location" not in st.session_state:
-        st.session_state.request_location = False
+    if st.button("📍 Start Geofence Monitoring", use_container_width=True):
+        if not name.strip():
+            st.warning("Please enter your name first.")
+        elif selected_site_id is None:
+            st.warning("No geofence site selected.")
+        else:
+            st.session_state.monitoring_started = True
+            st.success("Geofence monitoring started. Allow location permission if asked.")
 
-    if st.button("📍 ALLOW / GET MY CURRENT LOCATION", use_container_width=True):
-        st.session_state.request_location = True
+    if st.button("Stop Geofence Monitoring", use_container_width=True):
+        st.session_state.monitoring_started = False
+        st.info("Geofence monitoring stopped.")
 
-    if not st.session_state.request_location:
-        st.warning("Location permission has not been requested yet. Press the big button above.")
-    else:
-        st.info("If your browser asks for permission, choose Allow.")
+    @st.fragment(run_every="10s")
+    def geofence_monitor(username, site_id):
+        if not st.session_state.get("monitoring_started", False):
+            st.warning("Monitoring is not running yet.")
+            return
+
+        if not username.strip():
+            st.warning("Please enter your name first.")
+            return
+
+        if site_id is None:
+            st.warning("No geofence site selected.")
+            return
+
+        st.info("Checking your current location...")
 
         location = get_geolocation()
 
@@ -408,45 +714,58 @@ if mode == "User End":
                 st.error(
                     f"Location error: {location['error'].get('message', 'Unknown error')}"
                 )
-
                 st.warning(
-                    "If you previously tapped Block or Don't Allow, the browser may not show the popup again. "
-                    "In that case, you need to reset location permission for this website once."
+                    "If permission was blocked before, the browser may not show the popup again. "
+                    "You may need to reset location permission once."
                 )
+                return
 
-            else:
-                coords = location.get("coords", {})
-                lat = coords.get("latitude")
-                lon = coords.get("longitude")
-                accuracy = coords.get("accuracy")
+            coords = location.get("coords", {})
+            lat = coords.get("latitude")
+            lon = coords.get("longitude")
+            accuracy = coords.get("accuracy")
 
-                if lat is not None and lon is not None:
-                    st.success("Location detected.")
-                    st.write(f"Latitude: `{lat}`")
-                    st.write(f"Longitude: `{lon}`")
-                    st.write(f"Accuracy: `{accuracy}` meters")
+            if lat is None or lon is None:
+                st.warning("Location was detected but latitude/longitude is missing.")
+                return
 
-                    preview_map = folium.Map(location=[lat, lon], zoom_start=17)
-                    folium.Marker([lat, lon], popup="You are here").add_to(preview_map)
-                    st_folium(preview_map, height=350, width=None)
+            result_message = check_geofence_and_auto_attendance(
+                username.strip(),
+                site_id,
+                lat,
+                lon,
+                accuracy,
+            )
 
-                    if st.button("Save / Send my location", use_container_width=True):
-                        if not name.strip():
-                            st.warning("Please enter your name first.")
-                        else:
-                            save_location(
-                                name.strip(),
-                                "user",
-                                lat,
-                                lon,
-                                accuracy,
-                                event_type,
-                            )
-                            st.success("Your location was saved. The admin can now see it.")
-                else:
-                    st.warning("Location was detected but latitude/longitude is missing.")
+            st.success(result_message)
+
+            st.write(f"Latitude: `{lat}`")
+            st.write(f"Longitude: `{lon}`")
+            st.write(f"Accuracy: `{accuracy}` meters")
+
+            site = get_geofence_by_id(site_id)
+            site_df = pd.DataFrame([site]) if site is not None else pd.DataFrame()
+
+            user_map_df = pd.DataFrame(
+                [
+                    {
+                        "name": username,
+                        "latitude": lat,
+                        "longitude": lon,
+                        "accuracy": accuracy,
+                        "event_type": "Current Location",
+                        "site_name": site["site_name"] if site is not None else "",
+                        "created_at": get_ph_time(),
+                    }
+                ]
+            )
+
+            st_folium(make_map(user_map_df, site_df), height=400, width=None)
+
         else:
-            st.warning("Waiting for location permission. If nothing appears, check browser permission.")
+            st.warning("Waiting for location permission. If nothing appears, tap Start Geofence Monitoring again.")
+
+    geofence_monitor(name, selected_site_id)
 
     # -----------------------------
     # MANUAL LOCATION FALLBACK
@@ -459,21 +778,22 @@ if mode == "User End":
         manual_lat = st.number_input("Latitude", format="%.8f")
         manual_lon = st.number_input("Longitude", format="%.8f")
 
-        if st.button("Save manual location"):
+        if st.button("Check manual location against geofence"):
             if not name.strip():
                 st.warning("Please enter your name first.")
+            elif selected_site_id is None:
+                st.warning("No geofence site selected.")
             elif manual_lat == 0 or manual_lon == 0:
                 st.warning("Please enter valid latitude and longitude.")
             else:
-                save_location(
+                result_message = check_geofence_and_auto_attendance(
                     name.strip(),
-                    "user",
+                    selected_site_id,
                     manual_lat,
                     manual_lon,
                     None,
-                    event_type,
                 )
-                st.success("Manual location saved. Admin can now see it.")
+                st.success(result_message)
 
 
 # =====================================================
@@ -492,6 +812,79 @@ elif mode == "Admin End":
         df = load_locations()
         latest_df = latest_per_user(df)
         attendance_df = attendance_summary(df)
+        geofences_df = load_geofences()
+
+        # -----------------------------
+        # ADMIN DRAWS POLYGON GEOFENCE
+        # -----------------------------
+        st.subheader("Draw Polygon Geofence")
+
+        st.info(
+            "Use the polygon drawing tool on the left side of the map. "
+            "Draw the boundary of the work area, then type a site name and click Save Drawn Geofence."
+        )
+
+        site_name = st.text_input("New Geofence Site Name", placeholder="Example: NIA Site A")
+
+        draw_map = make_draw_map(geofences_df)
+
+        draw_result = st_folium(
+            draw_map,
+            height=500,
+            width=None,
+            returned_objects=["last_active_drawing", "all_drawings"],
+            key="draw_geofence_map",
+        )
+
+        if st.button("Save Drawn Geofence"):
+            if not site_name.strip():
+                st.warning("Please enter a site name first.")
+            else:
+                drawing = None
+
+                if draw_result:
+                    drawing = draw_result.get("last_active_drawing")
+
+                if not drawing:
+                    st.warning("Please draw a polygon on the map first.")
+                else:
+                    geometry = drawing.get("geometry", {})
+                    geometry_type = geometry.get("type")
+
+                    if geometry_type != "Polygon":
+                        st.warning("Please draw a polygon only.")
+                    else:
+                        polygon_coordinates = geometry.get("coordinates")
+
+                        if not polygon_coordinates:
+                            st.warning("Polygon data is missing.")
+                        else:
+                            save_geofence(site_name.strip(), polygon_coordinates)
+                            st.success(f"Geofence saved for {site_name}.")
+                            st.rerun()
+
+        # -----------------------------
+        # VIEW AND DELETE GEOFENCES
+        # -----------------------------
+        st.subheader("Saved Geofences")
+
+        if geofences_df.empty:
+            st.info("No geofences saved yet.")
+        else:
+            st.dataframe(
+                geofences_df[["id", "site_name", "created_at"]],
+                use_container_width=True,
+            )
+
+            geofence_ids = geofences_df["id"].tolist()
+            selected_geofence_id = st.selectbox("Select geofence ID to delete", geofence_ids)
+
+            if st.button("Delete selected geofence"):
+                delete_geofence(int(selected_geofence_id))
+                st.success(f"Geofence #{selected_geofence_id} deleted.")
+                st.rerun()
+
+        st.divider()
 
         # -----------------------------
         # ADMIN SENDS MESSAGE
@@ -517,7 +910,7 @@ elif mode == "Admin End":
         # -----------------------------
         # ADMIN DASHBOARD METRICS
         # -----------------------------
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
 
         col1.metric("Total Location Records", len(df))
         col2.metric(
@@ -525,12 +918,13 @@ elif mode == "Admin End":
             latest_df["name"].nunique() if not latest_df.empty else 0,
         )
         col3.metric("Latest User Updates", len(latest_df))
+        col4.metric("Saved Geofences", len(geofences_df))
 
         # -----------------------------
         # ADMIN MAP
         # -----------------------------
-        st.subheader("Latest location per user")
-        st_folium(make_map(latest_df), height=500, width=None)
+        st.subheader("Latest Location Per User with Geofences")
+        st_folium(make_map(latest_df, geofences_df), height=500, width=None)
 
         # -----------------------------
         # ATTENDANCE SUMMARY TABLE
@@ -544,6 +938,7 @@ elif mode == "Admin End":
                 attendance_df[
                     [
                         "name",
+                        "site_name",
                         "time_in",
                         "time_out",
                         "latest_event",
