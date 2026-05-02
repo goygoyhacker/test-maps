@@ -182,3 +182,32 @@ elif mode == "Admin End":
 
         if st.button("Refresh admin map"):
             st.rerun()
+
+            def save_message(sender, receiver, message):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO messages (sender, receiver, message, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (sender, receiver, message, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_messages_for_user(receiver):
+    conn = sqlite3.connect(DB_FILE)
+    df = pd.read_sql_query(
+        """
+        SELECT * FROM messages
+        WHERE receiver = ? OR receiver = 'ALL'
+        ORDER BY created_at DESC
+        LIMIT 10
+        """,
+        conn,
+        params=(receiver,),
+    )
+    conn.close()
+    return df
