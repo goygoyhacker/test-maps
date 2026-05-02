@@ -9,7 +9,7 @@ from streamlit_folium import st_folium
 from streamlit_js_eval import get_geolocation
 
 DB_FILE = "locations.db"
-ADMIN_PASSWORD = "admin123"  # change this later if you want
+ADMIN_PASSWORD = "admin123"
 PH_TIMEZONE = ZoneInfo("Asia/Manila")
 
 st.set_page_config(page_title="Simple Field Location Monitor", layout="wide")
@@ -67,7 +67,6 @@ def init_db():
         """
     )
 
-    # Add is_deleted column to old messages table if it does not exist yet
     c.execute("PRAGMA table_info(messages)")
     message_columns = [col[1] for col in c.fetchall()]
 
@@ -138,12 +137,10 @@ def attendance_summary(df):
         return pd.DataFrame()
 
     summary_rows = []
-
     users = df["name"].dropna().unique()
 
     for user in users:
         user_df = df[df["name"] == user].sort_values("id", ascending=False)
-
         latest_location = user_df.iloc[0]
 
         time_in_df = user_df[user_df["event_type"] == "Time In"]
@@ -279,7 +276,6 @@ def delete_all_messages():
 # -----------------------------
 def make_map(df):
     if df.empty:
-        # Default map center: Cagayan de Oro / nearby area
         return folium.Map(location=[8.4542, 124.6319], zoom_start=12)
 
     center_lat = df["latitude"].mean()
@@ -318,9 +314,7 @@ init_db()
 # APP UI
 # -----------------------------
 st.title("📍 Simple Field Location Monitor")
-st.caption(
-    "Prototype only: user shares location manually/with permission, admin views latest location on a map."
-)
+st.caption("Prototype only: user shares location with permission, admin views latest location on a map.")
 
 mode = st.sidebar.radio("Choose screen", ["User End", "Admin End"])
 
@@ -330,8 +324,10 @@ mode = st.sidebar.radio("Choose screen", ["User End", "Admin End"])
 # =====================================================
 if mode == "User End":
     st.header("User End / Field Worker")
+
     st.info(
-        "Open this on your phone. The browser will ask permission before sharing your location."
+        "Step 1: Enter your name. Step 2: Choose Time In or Time Out. "
+        "Step 3: Press the big location button below and allow location permission."
     )
 
     name = st.text_input("Your name", placeholder="Example: Josh")
@@ -387,50 +383,70 @@ if mode == "User End":
     # USER SENDS LOCATION
     # -----------------------------
     st.subheader("Send My Location")
-    st.write("Press the location button below, allow location permission, then save it.")
 
-    location = get_geolocation()
+    st.markdown(
+        """
+        ### Press this button first:
+        """
+    )
 
-    if location:
-        if "error" in location:
-            st.error(
-                f"Location error: {location['error'].get('message', 'Unknown error')}"
-            )
-        else:
-            coords = location.get("coords", {})
-            lat = coords.get("latitude")
-            lon = coords.get("longitude")
-            accuracy = coords.get("accuracy")
+    if "request_location" not in st.session_state:
+        st.session_state.request_location = False
 
-            if lat is not None and lon is not None:
-                st.success("Location detected.")
-                st.write(f"Latitude: `{lat}`")
-                st.write(f"Longitude: `{lon}`")
-                st.write(f"Accuracy: `{accuracy}` meters")
+    if st.button("📍 ALLOW / GET MY CURRENT LOCATION", use_container_width=True):
+        st.session_state.request_location = True
 
-                preview_map = folium.Map(location=[lat, lon], zoom_start=17)
-                folium.Marker([lat, lon], popup="You are here").add_to(preview_map)
-                st_folium(preview_map, height=350, width=None)
-
-                if st.button("Save / Send my location"):
-                    if not name.strip():
-                        st.warning("Please enter your name first.")
-                    else:
-                        save_location(
-                            name.strip(),
-                            "user",
-                            lat,
-                            lon,
-                            accuracy,
-                            event_type,
-                        )
-                        st.success(
-                            "Your location was saved. The admin can now see it."
-                        )
-            else:
-                st.warning("Location was detected but latitude/longitude is missing.")
+    if not st.session_state.request_location:
+        st.warning("Location permission has not been requested yet. Press the big button above.")
     else:
-        st.warning("No location yet. Click the geolocation button and allow permission.")
+        st.info("If your browser asks for permission, choose Allow.")
+
+        location = get_geolocation()
+
+        if location:
+            if "error" in location:
+                st.error(
+                    f"Location error: {location['error'].get('message', 'Unknown error')}"
+                )
+
+                st.warning(
+                    "If you previously tapped Block or Don't Allow, the browser may not show the popup again. "
+                    "In that case, you need to reset location permission for this website once."
+                )
+
+            else:
+                coords = location.get("coords", {})
+                lat = coords.get("latitude")
+                lon = coords.get("longitude")
+                accuracy = coords.get("accuracy")
+
+                if lat is not None and lon is not None:
+                    st.success("Location detected.")
+                    st.write(f"Latitude: `{lat}`")
+                    st.write(f"Longitude: `{lon}`")
+                    st.write(f"Accuracy: `{accuracy}` meters")
+
+                    preview_map = folium.Map(location=[lat, lon], zoom_start=17)
+                    folium.Marker([lat, lon], popup="You are here").add_to(preview_map)
+                    st_folium(preview_map, height=350, width=None)
+
+                    if st.button("Save / Send my location", use_container_width=True):
+                        if not name.strip():
+                            st.warning("Please enter your name first.")
+                        else:
+                            save_location(
+                                name.strip(),
+                                "user",
+                                lat,
+                                lon,
+                                accuracy,
+                                event_type,
+                            )
+                            st.success("Your location was saved. The admin can now see it.")
+                else:
+                    st.warning("Location was detected but latitude/longitude is missing.")
+        else:
+            st.warning("Waiting for location permission. If nothing appears, check browser permission.")
 
     # -----------------------------
     # MANUAL LOCATION FALLBACK
@@ -473,7 +489,6 @@ elif mode == "Admin End":
     else:
         st.success("Admin access granted.")
 
-        # Load records
         df = load_locations()
         latest_df = latest_per_user(df)
         attendance_df = attendance_summary(df)
