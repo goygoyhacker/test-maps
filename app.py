@@ -1,5 +1,6 @@
 import sqlite3
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import folium
 import pandas as pd
@@ -9,8 +10,16 @@ from streamlit_js_eval import get_geolocation
 
 DB_FILE = "locations.db"
 ADMIN_PASSWORD = "admin123"  # change this later if you want
+PH_TIMEZONE = ZoneInfo("Asia/Manila")
 
 st.set_page_config(page_title="Simple Field Location Monitor", layout="wide")
+
+
+# -----------------------------
+# TIME FUNCTION - PHILIPPINES TIME
+# -----------------------------
+def get_ph_time():
+    return datetime.now(PH_TIMEZONE).strftime("%Y-%m-%d %I:%M:%S %p")
 
 
 # -----------------------------
@@ -47,6 +56,24 @@ def init_db():
         """
     )
 
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dismissed_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            message_id INTEGER NOT NULL,
+            dismissed_at TEXT NOT NULL
+        )
+        """
+    )
+
+    # Add is_deleted column to old messages table if it does not exist yet
+    c.execute("PRAGMA table_info(messages)")
+    message_columns = [col[1] for col in c.fetchall()]
+
+    if "is_deleted" not in message_columns:
+        c.execute("ALTER TABLE messages ADD COLUMN is_deleted INTEGER DEFAULT 0")
+
     conn.commit()
     conn.close()
 
@@ -69,7 +96,7 @@ def save_location(name, role, lat, lon, accuracy, event_type):
             lon,
             accuracy,
             event_type,
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            get_ph_time(),
         ),
     )
     conn.commit()
@@ -78,16 +105,32 @@ def save_location(name, role, lat, lon, accuracy, event_type):
 
 def load_locations():
     conn = sqlite3.connect(DB_FILE)
-    df = pd.read_sql_query("SELECT * FROM locations ORDER BY created_at DESC", conn)
+    df = pd.read_sql_query("SELECT * FROM locations ORDER BY id DESC", conn)
     conn.close()
     return df
+
+
+def delete_user_locations(username):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM locations WHERE name = ?", (username,))
+    conn.commit()
+    conn.close()
+
+
+def delete_all_location_records():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM locations")
+    conn.commit()
+    conn.close()
 
 
 def latest_per_user(df):
     if df.empty:
         return df
 
-    return df.sort_values("created_at", ascending=False).drop_duplicates(subset=["name"])
+    return df.sort_values("id", ascending=False).drop_duplicates(subset=["name"])
 
 
 def attendance_summary(df):
@@ -99,7 +142,7 @@ def attendance_summary(df):
     users = df["name"].dropna().unique()
 
     for user in users:
-        user_df = df[df["name"] == user].sort_values("created_at", ascending=False)
+        user_df = df[df["name"] == user].sort_values("id", ascending=False)
 
         latest_location = user_df.iloc[0]
 
@@ -133,14 +176,14 @@ def save_message(sender, receiver, message):
     c = conn.cursor()
     c.execute(
         """
-        INSERT INTO messages (sender, receiver, message, created_at)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO messages (sender, receiver, message, created_at, is_deleted)
+        VALUES (?, ?, ?, ?, 0)
         """,
         (
             sender,
             receiver,
             message,
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            get_ph_time(),
         ),
     )
     conn.commit()
@@ -149,25 +192,86 @@ def save_message(sender, receiver, message):
 
 def load_messages_for_user(receiver):
     conn = sqlite3.connect(DB_FILE)
+
     df = pd.read_sql_query(
         """
-        SELECT * FROM messages
-        WHERE receiver = ? OR receiver = 'ALL'
-        ORDER BY created_at DESC
+        SELECT m.*
+        FROM messages m
+        WHERE 
+            (m.receiver = ? OR m.receiver = 'ALL')
+            AND m.is_deleted = 0
+            AND m.id NOT IN (
+                SELECT message_id 
+                FROM dismissed_messages 
+                WHERE username = ?
+            )
+        ORDER BY m.id DESC
         LIMIT 10
         """,
         conn,
-        params=(receiver,),
+        params=(receiver, receiver),
     )
+
     conn.close()
     return df
 
 
 def load_all_messages():
     conn = sqlite3.connect(DB_FILE)
-    df = pd.read_sql_query("SELECT * FROM messages ORDER BY created_at DESC", conn)
+    df = pd.read_sql_query(
+        """
+        SELECT * 
+        FROM messages 
+        WHERE is_deleted = 0
+        ORDER BY id DESC
+        """,
+        conn,
+    )
     conn.close()
     return df
+
+
+def dismiss_message(username, message_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+
+    c.execute(
+        """
+        SELECT id FROM dismissed_messages
+        WHERE username = ? AND message_id = ?
+        """,
+        (username, message_id),
+    )
+
+    existing = c.fetchone()
+
+    if existing is None:
+        c.execute(
+            """
+            INSERT INTO dismissed_messages (username, message_id, dismissed_at)
+            VALUES (?, ?, ?)
+            """,
+            (username, message_id, get_ph_time()),
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def delete_message(message_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE messages SET is_deleted = 1 WHERE id = ?", (message_id,))
+    conn.commit()
+    conn.close()
+
+
+def delete_all_messages():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE messages SET is_deleted = 1")
+    conn.commit()
+    conn.close()
 
 
 # -----------------------------
@@ -247,17 +351,35 @@ if mode == "User End":
         messages_df = load_messages_for_user(username.strip())
 
         if messages_df.empty:
-            st.info("No messages yet.")
+            st.info("No new messages.")
         else:
             latest = messages_df.iloc[0]
+            message_id = int(latest["id"])
 
-            st.toast(f"Admin: {latest['message']}")
-            st.warning(f"📩 Latest admin message: {latest['message']}")
+            st.warning(f"📩 Admin message: {latest['message']}")
             st.caption(f"Sent: {latest['created_at']}")
 
-            with st.expander("View older messages"):
+            if st.button("Dismiss message", key=f"dismiss_{message_id}"):
+                dismiss_message(username.strip(), message_id)
+                st.success("Message dismissed.")
+                st.rerun()
+
+            with st.expander("View other unread messages"):
                 for _, row in messages_df.iterrows():
-                    st.write(f"**{row['created_at']}** — {row['message']}")
+                    row_message_id = int(row["id"])
+
+                    st.write(f"**{row['created_at']}**")
+                    st.write(row["message"])
+
+                    if st.button(
+                        f"Dismiss this message #{row_message_id}",
+                        key=f"dismiss_old_{row_message_id}",
+                    ):
+                        dismiss_message(username.strip(), row_message_id)
+                        st.success("Message dismissed.")
+                        st.rerun()
+
+                    st.divider()
 
     show_admin_messages(name)
 
@@ -351,7 +473,7 @@ elif mode == "Admin End":
     else:
         st.success("Admin access granted.")
 
-        # Load location records
+        # Load records
         df = load_locations()
         latest_df = latest_per_user(df)
         attendance_df = attendance_summary(df)
@@ -373,6 +495,7 @@ elif mode == "Admin End":
             else:
                 save_message("admin", receiver, admin_message.strip())
                 st.success(f"Message sent to {receiver}.")
+                st.rerun()
 
         st.divider()
 
@@ -419,6 +542,81 @@ elif mode == "Admin End":
             )
 
         # -----------------------------
+        # DELETE USER LOCATION RECORDS
+        # -----------------------------
+        st.subheader("Delete User from Location Table")
+
+        if df.empty:
+            st.info("No users to delete yet.")
+        else:
+            delete_user = st.selectbox(
+                "Select user to delete",
+                sorted(df["name"].dropna().unique().tolist()),
+            )
+
+            confirm_delete_user = st.checkbox(
+                f"I confirm that I want to delete all location records for {delete_user}"
+            )
+
+            if st.button("Delete selected user location records"):
+                if confirm_delete_user:
+                    delete_user_locations(delete_user)
+                    st.success(f"Deleted all location records for {delete_user}.")
+                    st.rerun()
+                else:
+                    st.warning("Please check the confirmation box first.")
+
+            confirm_delete_all_users = st.checkbox(
+                "I confirm that I want to delete ALL location records"
+            )
+
+            if st.button("Delete ALL location records"):
+                if confirm_delete_all_users:
+                    delete_all_location_records()
+                    st.success("All location records deleted.")
+                    st.rerun()
+                else:
+                    st.warning("Please check the confirmation box first.")
+
+        # -----------------------------
+        # MESSAGE MANAGEMENT
+        # -----------------------------
+        st.subheader("Manage Sent Messages")
+
+        messages_df = load_all_messages()
+
+        if messages_df.empty:
+            st.info("No active messages.")
+        else:
+            st.dataframe(
+                messages_df[["id", "receiver", "message", "created_at"]],
+                use_container_width=True,
+            )
+
+            message_ids = messages_df["id"].tolist()
+            selected_message_id = st.selectbox(
+                "Select message ID to delete",
+                message_ids,
+            )
+
+            if st.button("Delete selected message"):
+                delete_message(int(selected_message_id))
+                st.success(f"Message #{selected_message_id} deleted.")
+                st.rerun()
+
+            confirm_delete_all_messages = st.checkbox(
+                "I confirm that I want to delete ALL sent messages"
+            )
+
+            if st.button("Delete ALL sent messages"):
+                if confirm_delete_all_messages:
+                    delete_all_messages()
+                    st.success("All messages deleted.")
+                    st.rerun()
+                else:
+                    st.warning("Please check the confirmation box first.")
+
+        # -----------------------------
         # ALL LOCATION RECORDS
         # -----------------------------
         with st.expander("View all location records"):
@@ -426,17 +624,6 @@ elif mode == "Admin End":
                 st.info("No location records yet.")
             else:
                 st.dataframe(df, use_container_width=True)
-
-        # -----------------------------
-        # ALL ADMIN MESSAGES
-        # -----------------------------
-        with st.expander("View all sent messages"):
-            messages_df = load_all_messages()
-
-            if messages_df.empty:
-                st.info("No messages sent yet.")
-            else:
-                st.dataframe(messages_df, use_container_width=True)
 
         if st.button("Refresh admin dashboard"):
             st.rerun()
