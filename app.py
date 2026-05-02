@@ -86,7 +86,43 @@ def load_locations():
 def latest_per_user(df):
     if df.empty:
         return df
+
     return df.sort_values("created_at", ascending=False).drop_duplicates(subset=["name"])
+
+
+def attendance_summary(df):
+    if df.empty:
+        return pd.DataFrame()
+
+    summary_rows = []
+
+    users = df["name"].dropna().unique()
+
+    for user in users:
+        user_df = df[df["name"] == user].sort_values("created_at", ascending=False)
+
+        latest_location = user_df.iloc[0]
+
+        time_in_df = user_df[user_df["event_type"] == "Time In"]
+        time_out_df = user_df[user_df["event_type"] == "Time Out"]
+
+        latest_time_in = time_in_df.iloc[0]["created_at"] if not time_in_df.empty else ""
+        latest_time_out = time_out_df.iloc[0]["created_at"] if not time_out_df.empty else ""
+
+        summary_rows.append(
+            {
+                "name": user,
+                "time_in": latest_time_in,
+                "time_out": latest_time_out,
+                "latest_event": latest_location["event_type"],
+                "latitude": latest_location["latitude"],
+                "longitude": latest_location["longitude"],
+                "accuracy": latest_location["accuracy"],
+                "last_update": latest_location["created_at"],
+            }
+        )
+
+    return pd.DataFrame(summary_rows)
 
 
 # -----------------------------
@@ -318,6 +354,7 @@ elif mode == "Admin End":
         # Load location records
         df = load_locations()
         latest_df = latest_per_user(df)
+        attendance_df = attendance_summary(df)
 
         # -----------------------------
         # ADMIN SENDS MESSAGE
@@ -358,22 +395,24 @@ elif mode == "Admin End":
         st_folium(make_map(latest_df), height=500, width=None)
 
         # -----------------------------
-        # LATEST TABLE
+        # ATTENDANCE SUMMARY TABLE
         # -----------------------------
-        st.subheader("Latest location table")
+        st.subheader("Attendance Summary")
 
-        if latest_df.empty:
+        if attendance_df.empty:
             st.info("No user locations yet.")
         else:
             st.dataframe(
-                latest_df[
+                attendance_df[
                     [
                         "name",
-                        "event_type",
+                        "time_in",
+                        "time_out",
+                        "latest_event",
                         "latitude",
                         "longitude",
                         "accuracy",
-                        "created_at",
+                        "last_update",
                     ]
                 ],
                 use_container_width=True,
@@ -383,7 +422,10 @@ elif mode == "Admin End":
         # ALL LOCATION RECORDS
         # -----------------------------
         with st.expander("View all location records"):
-            st.dataframe(df, use_container_width=True)
+            if df.empty:
+                st.info("No location records yet.")
+            else:
+                st.dataframe(df, use_container_width=True)
 
         # -----------------------------
         # ALL ADMIN MESSAGES
