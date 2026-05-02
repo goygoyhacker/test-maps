@@ -16,6 +16,7 @@ st.set_page_config(page_title="Simple Field Location Monitor", layout="wide")
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+
     c.execute(
         """
         CREATE TABLE IF NOT EXISTS locations (
@@ -30,6 +31,19 @@ def init_db():
         )
         """
     )
+
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender TEXT NOT NULL,
+            receiver TEXT NOT NULL,
+            message TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
 
